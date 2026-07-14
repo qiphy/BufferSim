@@ -177,9 +177,13 @@ def calculate_risk_inputs(frames, stored, pumped, rainfall_in, duration_hrs):
 
 def get_hf_token():
     try:
-        return st.secrets.get("HF_TOKEN") or os.getenv("HF_TOKEN")
+        return (
+            st.secrets.get("HF_TOKEN")
+            or os.getenv("HF_TOKEN")
+            or os.getenv("GITHUB_HF_TOKEN")
+        )
     except Exception:
-        return os.getenv("HF_TOKEN")
+        return os.getenv("HF_TOKEN") or os.getenv("GITHUB_HF_TOKEN")
 
 
 def request_huggingface_assessment(metrics):

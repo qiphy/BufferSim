@@ -1,373 +1,287 @@
-import streamlit as st
+import os
+import re
+import time
+
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import pydeck as pdk
-import os
-
-# ==========================================
-# 1. CONFIG
-# ==========================================
-st.set_page_config(page_title="Flood Particle Simulator", layout="wide")
-
-st.title("🌊 Flood Particle Simulation Model")
-st.markdown("Rainfall → Flow → Particle-like flood propagation over terrain")
-
-# ==========================================
-# 2. HYDROLOGY ENGINE
-# ==========================================
-class FloodGridEngine:
-    def __init__(self, n=60):
-        x = np.linspace(0, 10, n)
-        y = np.linspace(0, 10, n)
-        X, Y = np.meshgrid(x, y)
-
-        # bowl-shaped terrain (stable + smooth)
-        self.elevation = 0.08 * ((X - 5)**2 + (Y - 5)**2)
-
-        self.n = n
-        self.water = np.zeros((n, n))
-
-        # spatial infiltration 
-        self.infiltration = np.full((n, n), 0.02)
-
-    def add_rainfall(self, mm_hr):
-        rain_factor = 0.01
-        self.water += rain_factor * mm_hr
-
-    def apply_infiltration(self, rate):
-        # spatial infiltration
-        self.water = np.maximum(
-            0,
-            self.water - rate * self.infiltration
-        )
-
-    def step_flow(self, flow_speed):
-        # Total hydraulic head (Ground Elevation Contour + Water Depth)
-        h = self.elevation + self.water
-        w = self.water.copy()
-        new_w = np.zeros_like(w)
-
-        # Conceptual roughness coefficient (e.g., concrete vs grass)
-        manning_n = 0.035  
-
-        for i in range(1, self.n - 1):
-            for j in range(1, self.n - 1):
-                current_water = w[i, j]
-                if current_water <= 0.001:
-                    continue  # Skip dry cells to optimize performance
-
-                current_h = h[i, j]
-                neighbors = [(i+1, j), (i-1, j), (i, j+1), (i, j-1)]
-                
-                lower_neighbors = []
-                flow_factors = []
-
-                for ni, nj in neighbors:
-                    # Elevation drop acting as the slope driver (S)
-                    elevation_drop = current_h - h[ni, nj]
-                    
-                    if elevation_drop > 0:
-                        # 1. Calculate Slope Factor (S^0.5)
-                        slope_factor = np.sqrt(elevation_drop)
-                        
-                        # 2. Calculate Depth Factor (d^2/3) using local water depth
-                        depth_factor = current_water ** (2/3)
-                        
-                        # 3. Combine using Manning's approach for localized velocity
-                        local_velocity = (1.0 / manning_n) * depth_factor * slope_factor
-                        
-                        lower_neighbors.append((ni, nj))
-                        flow_factors.append(local_velocity)
-
-                if len(lower_neighbors) == 0:
-                    new_w[i, j] += current_water
-                    continue
-
-                # Normalize the directional flow factors
-                flow_factors = np.array(flow_factors)
-                total_factor = flow_factors.sum()
-                
-                if total_factor == 0:
-                    new_w[i, j] += current_water
-                    continue
-                    
-                weights = flow_factors / total_factor
-
-                # Outflow scales dynamically with flow speed and localized physical factors
-                outflow = current_water * flow_speed * (total_factor * 0.1)
-                outflow = min(outflow, current_water)  # Conservation of mass clamp
-
-                for k, (ni, nj) in enumerate(lower_neighbors):
-                    new_w[ni, nj] += outflow * weights[k]
-
-                new_w[i, j] += current_water - outflow
-
-        self.water = new_w
-        self.water *= 0.995  # Global drainage coefficient
-
-    def get_state(self):
-        return self.water
+import streamlit as st
+from dotenv import load_dotenv
+from huggingface_hub import InferenceClient
 
 
-# ==========================================
-# 3. TIME CONTROL & DYNAMIC SIDEBAR SLIDERS
-# ==========================================
+FIELD_AREA_M2 = 7_500.0
+ROWS, COLUMNS = 18, 14
+CELL_AREA_M2 = FIELD_AREA_M2 / (ROWS * COLUMNS)
+WEST, EAST = 101.527045, 101.528057
+SOUTH, NORTH = 3.029751, 3.031057
+
+# Load local development credentials before reading environment variables.
+load_dotenv()
+
+
+st.set_page_config(page_title="Flood Heatmap Simulator", layout="wide")
+st.title("🌊 SMART Eco-Field: Flood Heatmap Simulator")
+st.markdown("A cell-based rainfall, drainage, infiltration, and downhill-flow model.")
+
+
+@st.cache_data
+def simulate_flood(rainfall_mm, duration_hrs, pump_capacity_pct, infiltration_mm_hr):
+    """Return surface-water depth frames and a volume-conserving water balance."""
+    dt_seconds = 60
+    steps = duration_hrs * 60
+    rain_depth_per_step = (rainfall_mm / 1000) / steps
+    infiltration_depth_per_step = (infiltration_mm_hr / 1000) * dt_seconds / 3600
+    rain_volume_per_step = rain_depth_per_step * FIELD_AREA_M2
+    pump_volume_per_step = rain_volume_per_step * pump_capacity_pct
+
+    # A gentle north-east-to-south-west slope with a shallow low basin.
+    y, x = np.meshgrid(np.linspace(0, 1, ROWS), np.linspace(0, 1, COLUMNS), indexing="ij")
+    terrain = 0.45 * (x + y) + 0.08 * ((x - 0.22) ** 2 + (y - 0.22) ** 2)
+    water = np.zeros((ROWS, COLUMNS), dtype=float)
+    frames = np.zeros((steps, ROWS, COLUMNS), dtype=np.float32)
+    stored = np.zeros(steps)
+    pumped = np.zeros(steps)
+    infiltrated = np.zeros(steps)
+    rainfall_in = np.zeros(steps)
+
+    # Pump intakes are deliberately at the low, south-west end of the field.
+    pump_mask = np.zeros((ROWS, COLUMNS), dtype=bool)
+    pump_mask[:3, :3] = True
+
+    for step in range(steps):
+        water += rain_depth_per_step
+        rainfall_in[step] = rain_volume_per_step + (rainfall_in[step - 1] if step else 0)
+
+        infiltrated_depth = np.minimum(water, infiltration_depth_per_step)
+        water -= infiltrated_depth
+        infiltrated[step] = infiltrated_depth.sum() * CELL_AREA_M2 + (infiltrated[step - 1] if step else 0)
+
+        # Route water by hydraulic head. Each cell sends at most 35% of its
+        # current depth per minute, which keeps the explicit solver stable.
+        head = terrain + water
+        change = np.zeros_like(water)
+        for row in range(ROWS):
+            for column in range(COLUMNS):
+                neighbours = []
+                for d_row, d_column in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    n_row, n_column = row + d_row, column + d_column
+                    if 0 <= n_row < ROWS and 0 <= n_column < COLUMNS:
+                        head_drop = head[row, column] - head[n_row, n_column]
+                        if head_drop > 0:
+                            neighbours.append((n_row, n_column, head_drop))
+
+                if neighbours and water[row, column] > 0:
+                    total_drop = sum(drop for _, _, drop in neighbours)
+                    transferred = min(water[row, column] * 0.35, total_drop * 0.10)
+                    change[row, column] -= transferred
+                    for n_row, n_column, head_drop in neighbours:
+                        change[n_row, n_column] += transferred * head_drop / total_drop
+
+        water = np.maximum(0, water + change)
+
+        intake_volume = water[pump_mask].sum() * CELL_AREA_M2
+        removed_volume = min(intake_volume, pump_volume_per_step)
+        if intake_volume > 0:
+            water[pump_mask] *= 1 - removed_volume / intake_volume
+        pumped[step] = removed_volume + (pumped[step - 1] if step else 0)
+
+        frames[step] = water
+        stored[step] = water.sum() * CELL_AREA_M2
+
+    balance_error = rainfall_in - pumped - infiltrated - stored
+    return frames, terrain, stored, pumped, infiltrated, rainfall_in, balance_error
+
+
+@st.cache_data
+def grid_geometry():
+    cells = []
+    for row in range(ROWS):
+        for column in range(COLUMNS):
+            lon0 = WEST + (EAST - WEST) * column / COLUMNS
+            lon1 = WEST + (EAST - WEST) * (column + 1) / COLUMNS
+            lat0 = SOUTH + (NORTH - SOUTH) * row / ROWS
+            lat1 = SOUTH + (NORTH - SOUTH) * (row + 1) / ROWS
+            cells.append([[lon0, lat0], [lon1, lat0], [lon1, lat1], [lon0, lat1]])
+    return cells
+
+
+def render_map(depth_grid):
+    field_outline = pd.DataFrame([{
+        "coordinates": [[WEST, NORTH], [EAST, NORTH], [EAST, SOUTH], [WEST, SOUTH], [WEST, NORTH]]
+    }])
+    layers = [pdk.Layer(
+        "PolygonLayer",
+        field_outline,
+        get_polygon="coordinates",
+        get_fill_color=[60, 125, 70, 115],
+        get_line_color=[35, 90, 40, 230],
+    )]
+
+    cells = []
+    for coordinates, depth in zip(grid_geometry(), depth_grid.ravel()):
+        if depth < 0.001:
+            continue
+        # Light blue is shallow water; dark blue marks deeper pooled water.
+        intensity = min(depth / 0.25, 1.0)
+        cells.append({
+            "coordinates": coordinates,
+            "depth": float(depth),
+            "depth_label": f"{depth:.3f} m",
+            "color": [15, int(155 - 55 * intensity), int(235 - 35 * intensity), int(95 + 135 * intensity)],
+        })
+
+    if cells:
+        layers.append(pdk.Layer(
+            "PolygonLayer",
+            pd.DataFrame(cells),
+            get_polygon="coordinates",
+            get_elevation="depth",
+            elevation_scale=18,
+            extruded=True,
+            get_fill_color="color",
+            get_line_color=[20, 90, 160, 100],
+            pickable=True,
+        ))
+
+    return pdk.Deck(
+        map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
+        layers=layers,
+        initial_view_state=pdk.ViewState(latitude=3.030394, longitude=101.527550, zoom=16.5, pitch=55, bearing=15),
+        tooltip={"text": "Water depth: {depth_label}"},
+    )
+
+
+def calculate_risk_inputs(frames, stored, pumped, rainfall_in, duration_hrs):
+    """Prepare transparent inputs for the AI risk assessment."""
+    peak_step = int(np.argmax(stored))
+    peak_depth = float(frames[peak_step].max())
+    flooded_coverage = float((frames[peak_step] >= 0.02).mean() * 100)
+    pump_deficit = max(0.0, 1 - pumped[-1] / rainfall_in[-1]) if rainfall_in[-1] else 0.0
+    score = round(min(100, (
+        45 * min(peak_depth / 0.30, 1)
+        + 0.25 * flooded_coverage
+        + 20 * pump_deficit
+        + 10 * min(duration_hrs / 8, 1)
+    )))
+    return {
+        "peak_depth": peak_depth,
+        "peak_storage": float(stored[peak_step]),
+        "flooded_coverage": flooded_coverage,
+        "pumped": float(pumped[-1]),
+        "rainfall_in": float(rainfall_in[-1]),
+        "pump_deficit": pump_deficit * 100,
+        "risk_score": score,
+    }
+
+
+def get_hf_token():
+    try:
+        return st.secrets.get("HF_TOKEN") or os.getenv("HF_TOKEN")
+    except Exception:
+        return os.getenv("HF_TOKEN")
+
+
+def request_huggingface_assessment(metrics):
+    """Ask a Hugging Face chat model to turn calculated metrics into an alert."""
+    token = get_hf_token()
+    if not token:
+        raise RuntimeError("No HF_TOKEN is configured.")
+
+    formula = (
+        "risk score = round(min(100, 45*min(peak_depth/0.30,1) + "
+        "0.25*flooded_coverage_pct + 20*(pump_deficit_pct/100) + "
+        "10*min(duration_hours/8,1)))"
+    )
+    prompt = f"""Assess this conceptual flood simulation. Apply the formula exactly and do not invent data.
+Formula: {formula}
+Peak depth: {metrics['peak_depth']:.3f} m
+Peak stored water: {metrics['peak_storage']:.1f} m³
+Flooded coverage: {metrics['flooded_coverage']:.1f}%
+Pump deficit: {metrics['pump_deficit']:.1f}%
+Storm duration: {metrics['duration_hours']} hours
+
+Reply using exactly two lines:
+RISK_SCORE: integer from 0 to 100
+NOTIFICATION: one concise operational warning of at most 25 words"""
+    client = InferenceClient(api_key=token)
+    model = os.getenv("HF_MODEL", "google/gemma-4-31B-it")
+    response = client.chat_completion(
+        messages=[
+            {"role": "system", "content": "You are a precise flood-risk decision-support assistant."},
+            {"role": "user", "content": prompt},
+        ],
+        model=model,
+        max_tokens=100,
+        temperature=0.1,
+    )
+    content = response.choices[0].message.content.strip()
+    score_match = re.search(r"RISK_SCORE:\s*(\d{1,3})", content)
+    note_match = re.search(r"NOTIFICATION:\s*(.+)", content)
+    if not score_match or not note_match:
+        raise RuntimeError("The Hugging Face model returned an unexpected response format.")
+
+    return min(100, int(score_match.group(1))), note_match.group(1).strip()
+
+
 with st.sidebar:
-    st.header("🎛️ Storm & Ground Settings")
-    
-    # --- WEATHER CONFIG CONFIGURATIONS ---
-    st.subheader("🌧️ Rainfall Settings")
-    total_steps = st.slider("Storm Duration (Minutes)", 30, 120, 60, step=10)
-    peak_rain = st.slider("Peak Rain Intensity (mm/hr)", 50, 250, 120, step=10)
-    peak_time = st.slider("Minute of Peak Intensity", 10, total_steps - 10, int(total_steps / 3))
+    st.header("🎛️ Storm Parameters")
+    rainfall = st.slider("Total rainfall (mm)", 50, 600, 300, step=10)
+    storm_duration = st.slider("Storm duration (hours)", 2, 8, 4)
+    pump_capacity = st.slider("Pump capacity (% of rainfall inflow)", 0, 100, 50, step=5) / 100
+    infiltration = st.slider("Infiltration (mm/hour)", 0, 30, 8, step=1)
+    st.caption("Water flows toward the south-west pump intake. Values are conceptual and can be calibrated with site data.")
 
-    # --- ENVIRONMENT CONFIGURATIONS ---
-    st.subheader("🌱 Ground Conditions")
-    soil_absorption = st.slider(
-        "Soil Infiltration Rate", 
-        0.005, 0.08, 0.02, step=0.005, 
-        help="Higher values mean the ground absorbs water faster (concrete vs sand)."
-    )
-    water_velocity = st.slider(
-        "Water Flow Speed Factor", 
-        1.0, 6.0, 3.0, step=0.5, 
-        help="Controls how quickly gravity drags water downhill."
-    )
-
-    st.markdown("---")
-    st.header("⏳ Timeline Control")
-    
-    # Builds the weather graph values dynamically using your slider inputs
-    rain_series = np.concatenate([
-        np.linspace(0, peak_rain, peak_time),
-        np.linspace(peak_rain, 20, total_steps - peak_time)
-    ])
-
-    # Dynamic Simulation Cache runner (Re-fires automatically when settings change)
-    @st.cache_data
-    def run_dynamic_simulation(steps, series, absorption, speed):
-        engine = FloodGridEngine(n=60)
-        frames = []
-        terrain_elevation = engine.elevation.copy()
-        scaled_speed = speed * 0.02  
-        
-        for i in range(steps):
-            engine.add_rainfall(series[i])
-            engine.step_flow(scaled_speed)
-            engine.apply_infiltration(absorption)
-            frames.append(engine.get_state().copy())
-            
-        return frames, series, terrain_elevation
-
-    # Unpack all three variables safely in your sidebar thread
-    frames, rain_trace, terrain_elevation = run_dynamic_simulation(
-        total_steps, rain_series, soil_absorption, water_velocity
-    )
-    
-    # Interactive timestamp selector
-    t = st.slider("Select Time Step (Minutes into Storm)", 0, len(frames) - 1, 0)
-    
-    # Live frame variables processing
-    water_t = frames[t]
-    max_depth = np.max(water_t)
-    total_water = np.sum(water_t)
-    n = water_t.shape[0]
-    
-    center_min, center_max = int(n * 0.35), int(n * 0.65)
-    center_zone = water_t[center_min:center_max, center_min:center_max]
-    basin_water = np.sum(center_zone)
-    basin_percentage = (basin_water / total_water * 100) if total_water > 0 else 0
-
-    st.markdown("---")
-    st.header("🗺️ The Neighborhood Story")
-    st.info(f"""
-    * **The Shape of the Land:** We have modeled this neighborhood like a giant **kitchen bowl**.
-    * **The Speed Bumps:** The rows of dots are water getting temporarily trapped behind tiny ridges—like **puddles behind street speed humps**.
-    * **The Flood Pocket:** Right now, **{basin_percentage:.0f}%** of all runoff has pooled in the center bowl.
-    * **Deepest Point:** Maximum depth is **{max_depth:.2f} meters** in the middle of town.
-    """)
-    
-# ==========================================
-# 4. HUMAN-READABLE DASHBOARD (MAIN DISPLAY TOP)
-# ==========================================
-st.subheader("📊 Live Flood Status")
-
-flood_cells = np.sum(water_t > 0.01)
-total_cells = n * n
-flooded_percentage = (flood_cells / total_cells) * 100
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Water on Streets (Volume Index)", f"{total_water:.1f}")
-col2.metric("Worst-Case Depth", f"{max_depth:.2f} meters")
-col3.metric("Neighborhood Area Flooded", f"{flooded_percentage:.1f} %")
-
-if basin_percentage > 50:
-    st.error(f"🚨 **Emergency Status:** Over half of the storm's runoff ({basin_percentage:.1f}%) has accumulated in the center basin. Streets are heavily inundated, indicating a total drainage failure or blocked discharge pumps.")
-elif total_water > 0:
-    st.warning("⚠️ **Active Runoff:** Rain is falling. Water is actively sheeting off the higher perimeter roads and flowing down toward residential areas.")
-else:
-    st.success("🟢 **Dry Conditions:** No significant surface flooding or standing water detected on the roadways.")
-
-# ==========================================
-# 5. RAINFALL PLOT (TIMELINE)
-# ==========================================
-st.subheader("🌧️ Storm Timeline (Rainfall Intensity)")
-
-fig, ax = plt.subplots(figsize=(12, 2.5))
-ax.plot(rain_trace, color="#1f77b4", linewidth=2.5, label="Rainfall Amount")
-ax.axvline(t, color="red", linestyle="--", linewidth=2, label="You Are Here")
-ax.set_ylabel("Rain Intensity (mm/hr)")
-ax.set_xlabel("Minutes into Storm")
-ax.legend(loc="upper right")
-ax.grid(True, linestyle=":", alpha=0.6)
-st.pyplot(fig)
-
-# ==========================================
-# 6. 🌊 3D FLOOD DEPTH & CONTOUR VIEW
-# ==========================================
-st.subheader("🌊 Interactive 3D Flood Depth & Contour View")
-
-center_lat = 3.029628
-center_lon = 101.528775
-geo_step = 0.00008 
-
-lon_array = center_lon + (np.arange(n) - n // 2) * geo_step
-lat_array = center_lat + (np.arange(n) - n // 2) * geo_step
-
-yy, xx = np.meshgrid(lat_array, lon_array, indexing='ij')
-
-elevation_flat = terrain_elevation.flatten()
-lon_flat = xx.flatten()
-lat_flat = yy.flatten()
-water_flat = water_t.flatten()
-
-df = pd.DataFrame({
-    "lon": lon_flat,
-    "lat": lat_flat,
-    "water": water_flat,
-    "elevation": elevation_flat
-})
-
-df_water = df[df["water"] > 0.02].copy()
-
-def assign_depth_color(row):
-    w = row["water"]
-    if w < 0.05:
-        return [30, 144, 255, 140]   
-    elif w < 0.2:
-        return [0, 90, 220, 180]      
-    elif w < 0.5:
-        return [255, 140, 0, 210]     
-    else:
-        return [180, 0, 0, 230]       
-
-if not df_water.empty:
-    df_water["color"] = df_water.apply(assign_depth_color, axis=1)
-else:
-    df_water["color"] = [0, 0, 0, 0]
-
-water_3d_layer = pdk.Layer(
-    "GridCellLayer",
-    df_water,
-    get_position=["lon", "lat"],
-    get_elevation="water",
-    elevation_scale=30,           
-    cell_size=12,                 
-    get_fill_color="color",
-    pickable=True,
-    extruded=True,                
+frames, terrain, stored, pumped, infiltrated, rainfall_in, balance_error = simulate_flood(
+    rainfall, storm_duration, pump_capacity, infiltration
 )
 
-st.pydeck_chart(pdk.Deck(
-    map_style="https://basemaps.cartocdn.com/gl/positron-gl-style/style.json",
-    layers=[water_3d_layer],
-    initial_view_state=pdk.ViewState(
-        latitude=center_lat,
-        longitude=center_lon,
-        zoom=15.8,
-        pitch=45,                 
-        bearing=0               
-    ),
-    tooltip={"text": "Water Depth: {water}m\nTerrain Elevation: {elevation}m"}
-))
+peak_step = int(np.argmax(stored))
+ai_metrics = calculate_risk_inputs(frames, stored, pumped, rainfall_in, storm_duration)
+ai_metrics["duration_hours"] = storm_duration
+summary = st.columns(4)
+summary[0].metric("Peak water depth", f"{frames[peak_step].max():.3f} m")
+summary[1].metric("Peak stored water", f"{stored[peak_step]:,.0f} m³")
+summary[2].metric("Pumped", f"{pumped[-1]:,.0f} m³")
+summary[3].metric("Mass-balance error", f"{balance_error[-1]:.3f} m³")
 
-# ==========================================
-# 7. 🗺️ MAP COLOR LEGEND & VISUAL GUIDE
-# ==========================================
-st.markdown("### 🗺️ Map Color Legend & Hazard Guide")
-col_blue, col_red = st.columns(2)
+st.subheader("🤖 Hugging Face AI flood assessment")
+st.caption("The model applies a visible risk-score formula to the simulation results, then produces an operational notification.")
+if st.button("Calculate AI risk notification"):
+    if not get_hf_token():
+        st.info("Add `HF_TOKEN` to `.streamlit/secrets.toml` or your environment, then run the AI assessment.")
+    else:
+        with st.spinner("Hugging Face AI is calculating the flood-risk notification..."):
+            try:
+                ai_score, ai_notification = request_huggingface_assessment(ai_metrics)
+                st.success(f"AI risk score: {ai_score}/100")
+                st.warning(f"⚠️ {ai_notification}")
+            except Exception as error:
+                st.error(f"Hugging Face assessment could not be completed: {error}")
 
-with col_blue:
-    st.info("""
-    🔵 **The Blue Patterns = Shallow & Moving Water**
-    * **Light Blue Fringes:** Shallow rainwater sheeting across roads (roughly ankle-deep).
-    * **Rows of Blue Dots:** Isolated puddles getting blocked by minor layout elevations.
-    """)
+st.subheader("▶️ Flood Playback")
+play_column, status_column = st.columns([1, 3])
+status = status_column.empty()
+map_container = st.empty()
+map_container.pydeck_chart(render_map(frames[0]))
 
-with col_red:
-    st.error("""
-    🔴 **The Dark Red Clusters = Deep & Dangerous Pooling**
-    * **The Central Red Core:** Deep, trapped water accumulating at the lowest topographic location. 
-    * **Real-World Meaning:** Heavy road inundation where vehicle operation is strictly compromised.
-    """)
-
-# ==========================================
-# 8. 🤖 AI EMERGENCY ADVISORY ENGINE (SECURE INGESTION)
-# ==========================================
-st.markdown("---")
-st.subheader("🤖 AI Real-Time Command Advisory")
-
-# Ingest credentials securely from standard cloud environment configurations or user inputs
-ROUTER_TOKEN = os.environ.get("ROUTER_TOKEN") or st.sidebar.text_input("Enter AI Router Token Key", type="password")
-
-if not ROUTER_TOKEN:
-    st.info("💡 **Inference Engine Standby:** Provide your Access Token in the sidebar input box to activate live tactical bulletins.")
-else:
-    from openai import OpenAI
-
-    try:
-        client = OpenAI(
-            base_url="https://router.huggingface.co/v1",
-            api_key=ROUTER_TOKEN,
+if play_column.button("Play simulation", type="primary"):
+    for step in range(0, len(frames), 3):
+        minute = step
+        status.markdown(
+            f"**Time:** {minute // 60:02d}:{minute % 60:02d}  |  "
+            f"**Stored water:** {stored[step]:,.0f} m³  |  "
+            f"**Deepest cell:** {frames[step].max():.3f} m"
         )
-        
-        storm_progress_percentage = (t / total_steps) * 100
-        
-        emergency_prompt = f"""You are an AI Emergency Management Commander responding to a simulated flash flood event in Taman Sri Muda.
-        
-        CRITICAL TIME CONTEXT:
-        - Current Simulation Time: Minute {t} out of a total {total_steps} minute storm duration ({storm_progress_percentage:.0f}% progressed).
-        - Storm Peak Intensity: {peak_rain} mm/hr scheduled at Minute {peak_time}.
-        
-        CURRENT HYDROMETRIC SNAPSHOT:
-        - Total Surface Water Volume Index: {total_water:.2f}
-        - Worst-Case Peak Depth: {max_depth:.2f} meters
-        - Basin Pooling Concentration: {basin_percentage:.1f}% concentrated in the residential center bowl.
-        - Geographic Area Inundated: {flooded_percentage:.1f}%
-        
-        TACTICAL EVALUATION RULE:
-        - If the simulation time is under 5-10 minutes, water is just beginning to sheet off surfaces. Stand down from major evacuation orders unless worst-case depth already exceeds safe thresholds. Do not overreact to initial runoff.
-        
-        Provide a professional, clear, 3-bullet-point tactical advisory based EXACTLY on this timeline and data:
-        1. Resident status directive (e.g., Monitoring/Standby vs Shelter-in-Place vs Evacuate).
-        2. Emergency rescue deployment status (BOMBA / APM mobilization status).
-        3. Infrastructure drainage pump directive.
-        
-        Keep the tone professional, direct, and realistic. Do not mention code, matrices, or simulation parameters."""
+        map_container.pydeck_chart(render_map(frames[step]))
+        time.sleep(0.05)
+    st.success("Simulation complete.")
 
-        with st.spinner("🧠 Querying emergency inference engine..."):
-            completion = client.chat.completions.create(
-                model="google/gemma-4-31B-it:novita", 
-                messages=[
-                    {"role": "system", "content": "You are a professional crisis management AI specializing in local hydrological emergencies."},
-                    {"role": "user", "content": emergency_prompt}
-                ],
-                temperature=0.4
-            )
-            
-            st.markdown("### 📢 Live Tactical Bulletin")
-            st.write(completion.choices[0].message.content)
-
-    except Exception as e:
-        st.warning(f"📡 **Connection Issue:** Unable to reach the inference endpoint. Details: {e}")
+st.subheader("Water balance")
+chart = pd.DataFrame({
+    "Rainfall in": rainfall_in,
+    "Pumped": pumped,
+    "Infiltrated": infiltrated,
+    "Stored on field": stored,
+})
+st.line_chart(chart)

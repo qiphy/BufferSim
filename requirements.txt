@@ -4,3 +4,5 @@ pandas
 matplotlib
 pydeck
 openai
+huggingface_hub
+python-dotenv
